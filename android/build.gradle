@@ -112,7 +112,8 @@ android {
 
   packagingOptions {
     excludes = ["**/libc++_shared.so"]
-    exclude "META-INF/*"
+    exclude "META-INF/**"
+    pickFirst '**/*.so'
   }
 
   buildTypes {
