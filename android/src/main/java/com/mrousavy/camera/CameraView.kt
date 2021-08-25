@@ -27,6 +27,7 @@ import com.mrousavy.camera.utils.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.guava.await
 import java.lang.IllegalArgumentException
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.max
 import kotlin.math.min
@@ -60,8 +61,16 @@ import kotlin.math.min
 // TODO: takePhoto() return with jsi::Value Image reference for faster capture
 
 @Suppress("KotlinJniMissingFunction") // I use fbjni, Android Studio is not smart enough to realize that.
-@SuppressLint("ClickableViewAccessibility") // suppresses the warning that the pinch to zoom gesture is not accessible
-class CameraView(context: Context) : FrameLayout(context), LifecycleOwner {
+@SuppressLint("ClickableViewAccessibility", "ViewConstructor")
+class CameraView(context: Context, private val frameProcessorThread: ExecutorService) : FrameLayout(context), LifecycleOwner {
+  companion object {
+    const val TAG = "CameraView"
+    const val TAG_PERF = "CameraView.performance"
+
+    private val propsThatRequireSessionReconfiguration = arrayListOf("cameraId", "format", "fps", "hdr", "lowLightBoost", "photo", "video", "enableFrameProcessor")
+    private val arrayListOfZoom = arrayListOf("zoom")
+  }
+
   // react properties
   // props that require reconfiguring
   var cameraId: String? = null // this is actually not a react prop directly, but the result of setting device={}
@@ -95,6 +104,7 @@ class CameraView(context: Context) : FrameLayout(context), LifecycleOwner {
   private val cameraExecutor = Executors.newSingleThreadExecutor()
   internal val takePhotoExecutor = Executors.newSingleThreadExecutor()
   internal val recordVideoExecutor = Executors.newSingleThreadExecutor()
+  private var coroutineScope = CoroutineScope(Dispatchers.Main)
 
   internal var camera: Camera? = null
   internal var imageCapture: ImageCapture? = null
@@ -109,12 +119,14 @@ class CameraView(context: Context) : FrameLayout(context), LifecycleOwner {
   private val scaleGestureListener: ScaleGestureDetector.SimpleOnScaleGestureListener
   private val scaleGestureDetector: ScaleGestureDetector
   private val touchEventListener: OnTouchListener
-  private val orientationEventListener: OrientationEventListener
 
   private val lifecycleRegistry: LifecycleRegistry
   private var hostLifecycleState: Lifecycle.State
 
-  private var rotation: Int = Surface.ROTATION_0
+  private val rotation: Int
+    get() {
+      return context.displayRotation
+    }
 
   private var minZoom: Float = 1f
   private var maxZoom: Float = 1f
@@ -169,17 +181,6 @@ class CameraView(context: Context) : FrameLayout(context), LifecycleOwner {
     }
     scaleGestureDetector = ScaleGestureDetector(context, scaleGestureListener)
     touchEventListener = OnTouchListener { _, event -> return@OnTouchListener scaleGestureDetector.onTouchEvent(event) }
-    orientationEventListener = object : OrientationEventListener(context) {
-      override fun onOrientationChanged(orientation : Int) {
-        rotation = when (orientation) {
-          in 45..134 -> Surface.ROTATION_270
-          in 135..224 -> Surface.ROTATION_180
-          in 225..314 -> Surface.ROTATION_90
-          else -> Surface.ROTATION_0
-        }
-      }
-    }
-    orientationEventListener.enable()
 
     hostLifecycleState = Lifecycle.State.INITIALIZED
     lifecycleRegistry = LifecycleRegistry(this)
@@ -212,11 +213,6 @@ class CameraView(context: Context) : FrameLayout(context), LifecycleOwner {
       imageAnalysis?.targetRotation = rotation
       videoCapture?.setTargetRotation(rotation)
     }
-  }
-
-  fun finalize() {
-    mHybridData.resetNative()
-    orientationEventListener.disable()
   }
 
   private external fun initHybrid(): HybridData
@@ -261,8 +257,8 @@ class CameraView(context: Context) : FrameLayout(context), LifecycleOwner {
   fun update(changedProps: ArrayList<String>) = previewView.post {
     // TODO: Does this introduce too much overhead?
     //  I need to .post on the previewView because it might've not been initialized yet
-    //  I need to use GlobalScope.launch because of the suspend fun [configureSession]
-    GlobalScope.launch(Dispatchers.Main) {
+    //  I need to use CoroutineScope.launch because of the suspend fun [configureSession]
+    coroutineScope.launch {
       try {
         val shouldReconfigureSession = changedProps.containsAny(propsThatRequireSessionReconfiguration)
         val shouldReconfigureZoom = shouldReconfigureSession || changedProps.contains("zoom")
@@ -275,7 +271,7 @@ class CameraView(context: Context) : FrameLayout(context), LifecycleOwner {
           configureSession()
         }
         if (shouldReconfigureZoom) {
-          val zoomClamped = max(min(zoom.toFloat(), maxZoom), minZoom)
+          val zoomClamped = max(min(zoom, maxZoom), minZoom)
           camera!!.cameraControl.setZoomRatio(zoomClamped)
         }
         if (shouldReconfigureTorch) {
@@ -343,7 +339,7 @@ class CameraView(context: Context) : FrameLayout(context), LifecycleOwner {
       val imageAnalysisBuilder = ImageAnalysis.Builder()
         .setTargetRotation(rotation)
         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-        .setBackgroundExecutor(CameraViewModule.FrameProcessorThread)
+        .setBackgroundExecutor(frameProcessorThread)
 
       if (format == null) {
         // let CameraX automatically find best resolution for the target aspect ratio
@@ -481,13 +477,5 @@ class CameraView(context: Context) : FrameLayout(context), LifecycleOwner {
       map.putMap("cause", errorToMap(cause))
     }
     return map
-  }
-
-  companion object {
-    const val TAG = "CameraView"
-    const val TAG_PERF = "CameraView.performance"
-
-    private val propsThatRequireSessionReconfiguration = arrayListOf("cameraId", "format", "fps", "hdr", "lowLightBoost", "photo", "video", "enableFrameProcessor")
-    private val arrayListOfZoom = arrayListOf("zoom")
   }
 }
